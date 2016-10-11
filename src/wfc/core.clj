@@ -51,26 +51,32 @@
   (let [src (-> input-image
                 (io/resource)
                 (i/load-image))
-        dest (i/new-image 64 64)
+        dest (i/new-image 256 128)
         hist (img->hist src)
-        [mr mg mb] (img->mean-color src)]
+        [mr mg mb] (img->mean-color src)
+        entropy-map* (atom {})]
     ;; initial state
     (doseq [x (range (i/width dest))
             y (range (i/height dest))]
       (i/set-pixel dest x y (colour/rgb-from-components mr mg mb)))
 
-    (loop [i 100]
+    (reset! entropy-map*
+            (->> (for [x (range (+ (- (i/width dest) N) 1))
+                       y (range (+ (- (i/height dest) N) 1))]
+                   (let [patch (->> (i/sub-image dest x y N N)
+                                    (i/get-pixels)
+                                    (map colour/components-rgb)
+                                    (vec))]
+                     [[x y] [(entropy patch [mr mg mb]) patch]]))
+                 (into {})))
+
+    (loop [i 1000]
       ;; observe
-      (let [[[xd yd] _ patch] (->> (for [x (range (+ (- (i/width dest) N) 1))
-                                         y (range (+ (- (i/height dest) N) 1))]
-                                     (let [patch (->> (i/sub-image dest x y N N)
-                                                      (i/get-pixels)
-                                                      (map colour/components-rgb)
-                                                      (vec))]
-                                       [[x y] (entropy patch [ mr mg mb]) patch]))
-                                   (shuffle)
-                                   (sort-by second <)
-                                   (first))
+      (let [[[xd yd] [_ patch]] (->> @entropy-map*
+                                     (vec)
+                                     (shuffle)
+                                     (sort-by (comp first second) <)
+                                     (first))
             new-patch (generate-patch patch hist)]
 
         ;(if (zero? (mod i 10))
@@ -84,6 +90,8 @@
           (let [[nr ng nb]  (get new-patch (+ x (* y N)))]
             (i/set-pixel dest (+ x xd) (+ y yd)
                          (colour/rgb-from-components nr ng nb))))
+
+        (swap! entropy-map* assoc [xd yd] [(entropy new-patch [mr mg mb]) new-patch])
 
         (if (pos? i)
           (recur (dec i)))))
