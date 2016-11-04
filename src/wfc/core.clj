@@ -2,136 +2,158 @@
   (:require
     [clojure.pprint :refer [pprint]]
     [clojure.java.io :as io]
+    [clojure.set :as set]
     [mikera.image.core :as i]
-    [mikera.image.colours :as colour])
+    [mikera.image.colours :as c])
   (:gen-class))
 
 (def input-image "flowers.png")
 (def N 3)
 
-(defn img->mean-color [img]
-  (let [num-pixels (* (i/width img) (i/height img))]
+(defn img->all-rgb-pixels
+  [img]
   (->> img
        (i/get-pixels)
        (vec)
-       (map colour/components-rgb)
-       (reduce (fn [[x y z] [r g b]]
-                 [(+ r x) (+ g y) (+ b z)]) [0 0 0])
-       ((fn [[a b c]]
-          (mapv int [(/ a num-pixels) (/ b num-pixels) (/ c num-pixels)]))))))
+       (map c/components-rgb)))
 
-(defn img->hist
+(defn img->color-index
   [img]
-  (->> (for [x (range (+ (- (i/width img) N) 1))
-             y (range (+ (- (i/height img) N) 1))]
-         (->> (i/sub-image img x y N N)
-              (i/get-pixels)
-              (map colour/components-rgb)
-              (vec)))
-       (frequencies)))
+  (->> img
+       (img->all-rgb-pixels)
+       (distinct)
+       (map-indexed vector)
+       (into {})
+       (set/map-invert)))
 
-(defn patch->entropy [patch hist]
-  (let [num-pixels (* N N)
-        entropy (->> hist
-                     (map (fn [[pxs wt]]
-                            (reduce (fn [eax [a b]]
-                                      (if (= a b)
-                                        (inc eax)
-                                        eax)) 0 (map (fn [x y] [x y]) pxs patch))))
-                     (apply max))]
-    (double (/ entropy num-pixels))
-    #_(->> patch
-         (reduce (fn [[x y z] [r g b]]
-                   [(+ (Math/abs (- r mr)) x)
-                    (+ (Math/abs (- g mg)) y)
-                    (+ (Math/abs (- b mb)) z)]) [0 0 0])
-         ((fn [[a b c]]
-            (+ a b c))))))
+(defn img->indexed
+  [img color-index]
+  (let [w (i/width img)
+        h (i/height img)]
+    (->> (for [x (range -1 (inc w))
+               y (range -1 (inc h))]
+           [[x y] (if (and (<= 0 x (dec w))
+                           (<= 0 y (dec h)))
+                    (get color-index (c/components-rgb (i/get-pixel img x y)))
+                    -1)])
+         (into {}))))
 
-(defn filter-hist
-  [patch hist]
-  (->> hist
+(defn get-indexed-patch
+  [indexed x y]
+  (->> (for [yo [-1 0 1]
+             xo [-1 0 1]]
+         (get indexed [(+ x xo) (+ y yo)]))
+       (vec)))
+
+(defn indexed->w
+  [indexed]
+  (apply max (map (comp first first) indexed)))
+
+(defn indexed->h
+  [indexed]
+  (apply max (map (comp second first) indexed)))
+
+(defn indexed->indexed-hist
+  [indexed]
+  (let [w (indexed->w indexed)
+        h (indexed->h indexed)]
+    (->> (for [x (range w)
+               y (range h)]
+         (get-indexed-patch indexed x y))
+       (frequencies))))
+
+(defn filter-indexed-hist
+  [patch indexed-hist]
+  (->> indexed-hist
        (filter (fn [[pxs wt]]
                  (every? (fn [[px patch-px]]
-                           (or (= [158 211 172] patch-px)
+                           (or (= -2 patch-px)
                                (= px patch-px)))
                          (map (fn [x y] [x y]) pxs patch))))
        (into {})))
 
-(defn patch->new-patch [patch hist]
-    (let [hist (filter-hist patch hist)
-          total (apply + (vals hist))
-          n (rand-int total)]
-      (loop [candidate (first hist)
-             r (rest hist)
-             so-far (second candidate)]
-        (if (or (nil? so-far) (< n so-far))
-          (first candidate)
-          (recur (first r) (rest r) (+ so-far (second (first r))))))))
+(defn fresh-indexed-dest
+  [w h]
+  (->> (for [x (range -1 (inc w))
+             y (range -1 (inc h))]
+         [[x y] (if (and (<= 0 x (dec w))
+                         (<= 0 y (dec h)))
+                  -2
+                  -1)])
+       (into {})))
+
+(defn indexed-edge-patch?
+  [patch]
+  (some #{-1} patch))
+
+(defn indexed-patch->entropy
+  [patch indexed-hist]
+  (apply + (map second (filter-indexed-hist patch indexed-hist))))
+
+(defn produce-entropy-map
+  [dest indexed-hist]
+  (->> (for [x (range (indexed->w dest))
+             y (range (indexed->h dest))]
+         [[x y] (-> (get-indexed-patch dest x y)
+                    (indexed-patch->entropy indexed-hist))])
+       (into {})))
+
+(defn indexed-patch->new-patch
+  [patch indexed-hist]
+  (let [hist (filter-indexed-hist patch indexed-hist)
+        total (apply + (vals hist))
+        n (rand-int total)]
+    (loop [candidate (first hist)
+           r (rest hist)
+           so-far (second candidate)]
+      (if (or (nil? so-far) (< n so-far))
+        (first candidate)
+        (recur (first r) (rest r) (+ so-far (second (first r))))))))
+
+(defn observe-propigate
+  [entropy-map dest indexed-hist dest-w dest-h]
+  (let [[x y] (->> entropy-map
+                   seq
+                   shuffle
+                   (sort-by second)
+                   ffirst)
+        least-entropy-patch (get-indexed-patch dest x y)
+        new-patch (indexed-patch->new-patch least-entropy-patch indexed-hist)
+        new-dest
+        (reduce (fn [eax [xo yo]]
+                  (let [idx (+ (inc xo) (* 3 (inc yo)))]
+                    (assoc eax [(+ x xo) (+ y yo)] (get new-patch idx))))
+                dest
+                (for [xo [-1 0 1] yo [-1 0 1]] [xo yo]))
+        new-entropy-map
+        (reduce (fn [eax [xo yo]]
+                  (cond
+                    (= 0 xo yo) (dissoc eax [(+ x xo) (+ y yo)])
+                    (and (<= 0 (+ x xo) (dec dest-w))
+                         (<= 0 (+ y yo) (dec dest-h)))
+                    (assoc eax [(+ x xo) (+ y yo)] (indexed-patch->entropy
+                                                    (get-indexed-patch new-dest (+ x xo) (+ y yo))
+                                                    indexed-hist))
+                    :else eax))
+                entropy-map
+                (for [xo [-1 0 1] yo [-1 0 1]] [xo yo]))]
+    [new-dest new-entropy-map]))
+
+(defn wfc
+  [src-path dest-w dest-h]
+  (let [img (i/load-image-resource src-path)
+        color-index (img->color-index img)
+        reverse-color-index (set/map-invert color-index)
+        indexed (img->indexed img color-index)
+        indexed-hist (indexed->indexed-hist indexed)]
+    (loop [dest (fresh-indexed-dest dest-w dest-h)
+           entropy-map (produce-entropy-map dest indexed-hist)]
+      (if (empty? entropy-map)
+        dest
+        (let [[new-dest new-entropy-map]
+              (observe-propigate entropy-map dest indexed-hist dest-w dest-h)]
+          (recur new-dest new-entropy-map))))))
 
 (defn -main
   [& args]
-  (let [src (-> input-image
-                (io/resource)
-                (i/load-image))
-        dest (i/new-image 64 64)
-        hist (img->hist src)
-        [mr mg mb] (img->mean-color src)
-        entropy-map* (atom {})]
-    ;; initial state
-    (doseq [x (range (i/width dest))
-            y (range (i/height dest))]
-      (i/set-pixel dest x y (colour/rgb-from-components mr mg mb)))
-
-    (reset! entropy-map*
-            (->> (for [x (range (+ (- (i/width dest) N) 1))
-                       y (range (+ (- (i/height dest) N) 1))]
-                   (let [patch (->> (i/sub-image dest x y N N)
-                                    (i/get-pixels)
-                                    (map colour/components-rgb)
-                                    (vec))]
-                     [[x y] [(patch->entropy patch hist) patch]]))
-                 (into {})))
-
-    (loop [i 2000]
-      ;; observe
-      (let [[[xd yd] [chosen-entropy patch]] (->> @entropy-map*
-                                     (vec)
-                                     (shuffle)
-                                     (apply max-key #(first (second %))))
-            new-patch (patch->new-patch patch hist)]
-
-
-
-        ;(if (zero? (mod i 10))
-        ;  (println i))
-
-        (println i (first patch) xd yd (count @entropy-map*) chosen-entropy)
-
-        ;; propagate
-        (doseq [x (range N)
-                y (range N)]
-          (let [[nr ng nb]  (get new-patch (+ x (* y N)) [mr mg mb])]
-            (when (and (<= 0 (+ x xd) (- (i/width dest) N))
-                     (<= 0 (+ y yd) (- (i/height dest) N)))
-              (i/set-pixel dest (+ x xd) (+ y yd)
-                           (colour/rgb-from-components nr ng nb)))))
-
-        (doseq [xe (range (- xd (dec N)) (+ xd N))
-                ye (range (- yd (dec N)) (+ yd N))]
-            (if (and (<= 0 xe (- (i/width dest) N))
-                     (<= 0 ye (- (i/height dest) N)))
-              (let [patch (->> (i/sub-image dest xe ye N N)
-                               (i/get-pixels)
-                               (map colour/components-rgb)
-                               (vec))
-                    new-entropy (patch->entropy patch hist)]
-                (if (= new-entropy 1.0)
-                  (swap! entropy-map* dissoc [xe ye])
-                  (if (get @entropy-map* [xe ye])
-                    (swap! entropy-map* assoc [xe ye] [new-entropy patch]))))))
-
-        (if (and (pos? i) (pos? (count @entropy-map*)))
-          (recur (dec i)))))
-    (i/save dest "out.png")
-    (i/show dest)))
+  (wfc input-image 64 64))
