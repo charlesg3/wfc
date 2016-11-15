@@ -5,10 +5,44 @@
     [clojure.set :as set]
     [mikera.image.core :as i]
     [mikera.image.colours :as c])
+  (:import [javax.swing JPanel]
+           [java.awt BorderLayout]
+           [mikera.gui Frames JIcon])
   (:gen-class))
 
-(def input-image "flowers.png")
+(def input-image "math.png")
 (def N 3)
+(def panel* (atom nil))
+
+(defn show-image
+  [img & {:keys [zoom]}]
+  (let [panel (or @panel* (JPanel.))
+        img (if zoom
+              (let [w (i/width img)
+                    h (i/height img)
+                    new-img (i/new-image (* zoom w) (* zoom h))]
+                (doseq [x (range w)
+                        y (range h)]
+                  (i/fill! (i/sub-image new-img (* x zoom) (* y zoom) zoom zoom)
+                           (i/get-pixel img x y)))
+                new-img)
+              img)]
+    (.setLayout panel (BorderLayout.))
+    (.removeAll panel)
+    (.add panel (JIcon. img) BorderLayout/CENTER)
+    (Frames/display panel "WFC Image"))
+  :ok)
+
+(defn indexed->img
+  [dest reverse-color-index w h]
+  (let [img (i/new-image w h)]
+    (doseq [x (range w)
+            y (range h)]
+      (let [c (get dest [x y])
+            rgb (->> (get reverse-color-index c [0 0 0])
+                     (map #(/ % 255.0)))]
+        (i/set-pixel img x y (apply c/rgb rgb))))
+    img))
 
 (defn img->all-rgb-pixels
   [img]
@@ -131,16 +165,21 @@
                     (= 0 xo yo) (dissoc eax [(+ x xo) (+ y yo)])
                     (and (<= 0 (+ x xo) (dec dest-w))
                          (<= 0 (+ y yo) (dec dest-h)))
-                    (assoc eax [(+ x xo) (+ y yo)] (indexed-patch->entropy
-                                                    (get-indexed-patch new-dest (+ x xo) (+ y yo))
-                                                    indexed-hist))
+                    (if (get eax [(+ x xo) (+ y yo)])
+                      (assoc eax [(+ x xo) (+ y yo)] (indexed-patch->entropy
+                                                      (get-indexed-patch new-dest (+ x xo) (+ y yo))
+                                                      indexed-hist))
+                      eax)
                     :else eax))
                 entropy-map
                 (for [xo [-1 0 1] yo [-1 0 1]] [xo yo]))]
-    [new-dest new-entropy-map]))
+    (if-not new-patch
+      [dest (dissoc entropy-map [x y])]
+      [new-dest new-entropy-map])))
 
 (defn wfc
   [src-path dest-w dest-h]
+  (reset! panel* nil)
   (let [img (i/load-image-resource src-path)
         color-index (img->color-index img)
         reverse-color-index (set/map-invert color-index)
@@ -152,6 +191,8 @@
         dest
         (let [[new-dest new-entropy-map]
               (observe-propigate entropy-map dest indexed-hist dest-w dest-h)]
+          (println "Entropy map count:" (count new-entropy-map) "Showing img...")
+          (show-image (indexed->img new-dest reverse-color-index dest-w dest-h) :zoom 8)
           (recur new-dest new-entropy-map))))))
 
 (defn -main
